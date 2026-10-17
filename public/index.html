@@ -55,3 +55,60 @@
   </div>
   <div id="toast" class="toast hidden" role="status"></div>
 </body></html>
+<details class="registration-panel">
+  <summary>Need an account? Register as a parent or student</summary>
+
+  <p class="muted">Registration requests must be verified by your school.</p>
+
+  <h3>Parent registration</h3>
+  <form id="signup-parent-form">
+    <label for="parent-school">School</label>
+    <select id="parent-school" required>
+      <option value="">Loading schools...</option>
+    </select>
+
+    <label for="parent-full-name">Your full name</label>
+    <input id="parent-full-name" type="text" required maxlength="160">
+
+    <label for="parent-email">Email address</label>
+    <input id="parent-email" type="email" required maxlength="254">
+
+    <label for="parent-password">Create password</label>
+    <input id="parent-password" type="password" required minlength="12" maxlength="200" autocomplete="new-password">
+
+    <label for="parent-admission-number">Child's admission number</label>
+    <input id="parent-admission-number" type="text" required maxlength="40">
+
+    <button class="primary full" type="submit">Submit parent registration</button>
+  </form>
+
+  <hr>
+
+  <h3>Student registration</h3>
+  <form id="signup-student-form">
+    <label for="student-school">School</label>
+    <select id="student-school" required>
+      <option value="">Loading schools...</option>
+    </select>
+
+    <label for="student-full-name">Student's full name</label>
+    <input id="student-full-name" type="text" required maxlength="160">
+
+    <label for="student-email">Student's email address</label>
+    <input id="student-email" type="email" required maxlength="254">
+
+    <label for="student-password">Create password</label>
+    <input id="student-password" type="password" required minlength="12" maxlength="200" autocomplete="new-password">
+
+    <label for="student-admission-number">Admission number</label>
+    <input id="student-admission-number" type="text" required maxlength="40">
+
+    <label for="student-dob">Date of birth</label>
+    <input id="student-dob" type="date" required>
+
+    <button class="primary full" type="submit">Submit student registration</button>
+  </form>
+
+  <p id="signup-message" role="status" aria-live="polite"></p>
+</details>
+
