@@ -1,0 +1,105 @@
+
+name: EduCore Database Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Choose one database operation"
+        required: true
+        type: choice
+        options:
+          - initialize-database
+          - create-first-admin
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Check database configuration
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "Missing DATABASE_URL repository secret."
+            exit 1
+          fi
+          echo "Database configuration is present."
+
+      - name: Initialize database tables
+        if: ${{ inputs.operation == 'initialize-database' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: npm run db:init
+
+      - name: Check database before creating first admin
+        if: ${{ inputs.operation == 'create-first-admin' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { pool } = require('./server/src/db');
+
+          (async () => {
+            try {
+              const schools = await pool.query(
+                'SELECT COUNT(*)::int AS n FROM schools'
+              );
+              const users = await pool.query(
+                'SELECT COUNT(*)::int AS n FROM users'
+              );
+
+              if (schools.rows[0].n !== 0 ||
+                  users.rows[0].n !== 0) {
+                throw new Error(
+                  'Database is not empty. Refusing to create duplicate records.'
+                );
+              }
+
+              console.log(
+                'Tables exist and are empty. Initial admin creation is allowed.'
+              );
+            } catch (error) {
+              console.error('Safety check failed:', error.message);
+              process.exitCode = 1;
+            } finally {
+              await pool.end();
+            }
+          })();
+          NODE
+
+      - name: Create first school administrator
+        if: ${{ inputs.operation == 'create-first-admin' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ADMIN_SCHOOL_NAME: ${{ secrets.ADMIN_SCHOOL_NAME }}
+          ADMIN_FULL_NAME: ${{ secrets.ADMIN_FULL_NAME }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          test -n "$ADMIN_SCHOOL_NAME"
+          test -n "$ADMIN_FULL_NAME"
+          test -n "$ADMIN_EMAIL"
+          test -n "$ADMIN_PASSWORD"
+
+          npm run admin:create -- \
+            "$ADMIN_SCHOOL_NAME" \
+            "$ADMIN_FULL_NAME" \
+            "$ADMIN_EMAIL" \
+            "$ADMIN_PASSWORD"
