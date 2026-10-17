@@ -1,0 +1,120 @@
+
+name: Create First Admin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-admin:
+    name: Safely create school and Admin account
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Verify required secrets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ADMIN_SCHOOL_NAME: ${{ secrets.ADMIN_SCHOOL_NAME }}
+          ADMIN_FULL_NAME: ${{ secrets.ADMIN_FULL_NAME }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          test -n "$DATABASE_URL" || { echo "DATABASE_URL is missing"; exit 1; }
+          test -n "$ADMIN_SCHOOL_NAME" || { echo "ADMIN_SCHOOL_NAME is missing"; exit 1; }
+          test -n "$ADMIN_FULL_NAME" || { echo "ADMIN_FULL_NAME is missing"; exit 1; }
+          test -n "$ADMIN_EMAIL" || { echo "ADMIN_EMAIL is missing"; exit 1; }
+          test -n "$ADMIN_PASSWORD" || { echo "ADMIN_PASSWORD is missing"; exit 1; }
+          test "${#ADMIN_PASSWORD}" -ge 12 || { echo "Admin password must be at least 12 characters"; exit 1; }
+          echo "Required secrets are present."
+
+      - name: Verify database tables and protect existing records
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Pool } = require('pg');
+
+          (async () => {
+            const pool = new Pool({
+              connectionString: process.env.DATABASE_URL,
+              ssl: { rejectUnauthorized: true },
+              connectionTimeoutMillis: 10000,
+              max: 1
+            });
+
+            try {
+              const result = await pool.query(`
+                SELECT
+                  to_regclass('public.schools') AS schools_table,
+                  to_regclass('public.users') AS users_table,
+                  to_regclass('public.students') AS students_table
+              `);
+
+              const tables = result.rows[0];
+
+              if (
+                !tables.schools_table ||
+                !tables.users_table ||
+                !tables.students_table
+              ) {
+                throw new Error(
+                  'Required tables are missing. Initialize the database first; no Admin was created.'
+                );
+              }
+
+              const counts = await pool.query(`
+                SELECT
+                  (SELECT COUNT(*) FROM schools) AS schools,
+                  (SELECT COUNT(*) FROM users) AS users,
+                  (SELECT COUNT(*) FROM students) AS students
+              `);
+
+              const c = counts.rows[0];
+
+              console.log(
+                `Record counts: schools=${c.schools}, users=${c.users}, students=${c.students}`
+              );
+
+              if (
+                Number(c.schools) !== 0 ||
+                Number(c.users) !== 0 ||
+                Number(c.students) !== 0
+              ) {
+                throw new Error(
+                  'Database contains existing records. Admin creation stopped to protect them.'
+                );
+              }
+
+              console.log('Database safety check passed.');
+            } finally {
+              await pool.end();
+            }
+          })().catch(error => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
+          NODE
+
+      - name: Create the first Admin account
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
+          ADMIN_SCHOOL_NAME: ${{ secrets.ADMIN_SCHOOL_NAME }}
+          ADMIN_FULL_NAME: ${{ secrets.ADMIN_FULL_NAME }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          npm run admin:create -- "$ADMIN_SCHOOL_NAME" "$ADMIN_FULL_NAME" "$ADMIN_EMAIL" "$ADMIN_PASSWORD"
