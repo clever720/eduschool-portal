@@ -6,10 +6,11 @@ const { z } = require('zod');
 const { pool } = require('../db');
 const { validate } = require('../middleware/validate');
 const { requireAuth, allowRoles } = require('../middleware/auth');
+const { audit } = require('../middleware/audit');
 
 const router = express.Router();
 
-/* -------------------- VALIDATION SCHEMAS -------------------- */
+/* -------------------- VALIDATION -------------------- */
 
 const loginSchema = z.object({
   email: z.string().trim().email().max(254),
@@ -41,6 +42,16 @@ const approveStudentSchema = z.object({
   studentId: z.string().uuid()
 });
 
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: {
+    error: 'Too many login attempts. Please try again later.'
+  }
+});
+
 const signupLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 5,
@@ -60,76 +71,85 @@ router.get('/schools', async (_req, res, next) => {
     );
 
     res.json({ schools: result.rows });
-  } catch (err) {
-    next(err);
+  } catch (error) {
+    next(error);
   }
 });
 
 /* -------------------- CURRENT SESSION -------------------- */
 
 router.get('/me', (req, res) => {
-  if (!req.session?.user) {
-    return res.json({ user: null });
-  }
-
-  res.json({ user: req.session.user });
+  res.json({
+    user: req.session?.user || null
+  });
 });
 
 /* -------------------- LOGIN -------------------- */
 
-router.post('/login', validate(loginSchema), async (req, res, next) => {
-  try {
-    const { email, password } = req.validatedBody;
+router.post(
+  '/login',
+  loginLimiter,
+  validate(loginSchema),
+  async (req, res, next) => {
+    try {
+      const { email, password } = req.validatedBody;
 
-    const result = await pool.query(
-      `SELECT u.id, u.school_id, u.full_name, u.email,
-              u.password_hash, u.role, u.active,
-              s.name AS school_name
-       FROM users u
-       JOIN schools s ON s.id = u.school_id
-       WHERE LOWER(u.email) = LOWER($1)
-       LIMIT 2`,
-      [email.trim()]
-    );
+      const result = await pool.query(
+        `SELECT
+           u.id,
+           u.school_id,
+           u.full_name,
+           u.email,
+           u.password_hash,
+           u.role,
+           u.active,
+           s.name AS school_name
+         FROM users u
+         JOIN schools s ON s.id = u.school_id
+         WHERE LOWER(u.email) = LOWER($1)
+         LIMIT 2`,
+        [email.trim()]
+      );
 
-    // Emails must resolve to exactly one account.
-    // If the same email exists at multiple schools, login needs a
-    // school-specific selection rather than choosing an arbitrary account.
-    const user = result.rows.length === 1 ? result.rows[0] : null;
+      // Never select an arbitrary account if an email exists
+      // at more than one school.
+      const user =
+        result.rows.length === 1 ? result.rows[0] : null;
 
-    const valid = user
-      ? await bcrypt.compare(password, user.password_hash)
-      : false;
+      const passwordMatches = user
+        ? await bcrypt.compare(password, user.password_hash)
+        : false;
 
-    if (!user || !valid || !user.active) {
-      return res.status(401).json({
-        error:
-          'Email or password is incorrect, or the account is awaiting approval.'
+      if (!user || !passwordMatches || !user.active) {
+        return res.status(401).json({
+          error:
+            'Email or password is incorrect, or the account is awaiting approval.'
+        });
+      }
+
+      req.session.regenerate((error) => {
+        if (error) return next(error);
+
+        req.session.user = {
+          id: user.id,
+          schoolId: user.school_id,
+          name: user.full_name,
+          email: user.email,
+          role: user.role,
+          schoolName: user.school_name
+        };
+
+        req.session.save((saveError) => {
+          if (saveError) return next(saveError);
+
+          res.json({ user: req.session.user });
+        });
       });
+    } catch (error) {
+      next(error);
     }
-
-    req.session.regenerate((err) => {
-      if (err) return next(err);
-
-      req.session.user = {
-        id: user.id,
-        schoolId: user.school_id,
-        name: user.full_name,
-        email: user.email,
-        role: user.role,
-        schoolName: user.school_name
-      };
-
-      req.session.save((saveErr) => {
-        if (saveErr) return next(saveErr);
-
-        res.json({ user: req.session.user });
-      });
-    });
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 /* -------------------- PARENT REGISTRATION -------------------- */
 
@@ -143,14 +163,14 @@ router.post(
     try {
       client = await pool.connect();
 
-      const b = req.validatedBody;
-      const email = b.email.trim().toLowerCase();
+      const body = req.validatedBody;
+      const email = body.email.trim().toLowerCase();
 
       await client.query('BEGIN');
 
       const school = await client.query(
         'SELECT id FROM schools WHERE id = $1',
-        [b.schoolId]
+        [body.schoolId]
       );
 
       if (!school.rowCount) {
@@ -161,56 +181,86 @@ router.post(
         });
       }
 
-      const hash = await bcrypt.hash(b.password, 12);
+      // A parent can register only when the admission number and
+      // email match an existing school record.
+      const matchingStudent = await client.query(
+        `SELECT id
+         FROM students
+         WHERE school_id = $1
+           AND admission_number = $2
+           AND LOWER(COALESCE(parent_email, '')) = $3
+           AND active = TRUE
+         LIMIT 1`,
+        [
+          body.schoolId,
+          body.studentAdmissionNumber.trim(),
+          email
+        ]
+      );
+
+      if (!matchingStudent.rowCount) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          error:
+            'The details could not be matched to an active student record. Please contact your school to check its records.'
+        });
+      }
+
+      const passwordHash = await bcrypt.hash(body.password, 12);
 
       const created = await client.query(
-        `INSERT INTO users
-           (school_id, full_name, email, password_hash, role, active)
+        `INSERT INTO users (
+           school_id,
+           full_name,
+           email,
+           password_hash,
+           role,
+           active
+         )
          VALUES ($1, $2, $3, $4, 'parent', FALSE)
          RETURNING id`,
-        [b.schoolId, b.fullName.trim(), email, hash]
+        [
+          body.schoolId,
+          body.fullName.trim(),
+          email,
+          passwordHash
+        ]
       );
 
       const parentUserId = created.rows[0].id;
+      const studentId = matchingStudent.rows[0].id;
 
-      // Create a pending parent-child link only when the school's
-      // existing student record contains the same parent email.
-      // The school must verify the relationship before access is granted.
       await client.query(
-        `INSERT INTO parent_student_links
-           (parent_user_id, student_id, school_id, verified_at)
-         SELECT $1, st.id, st.school_id, NULL
-         FROM students st
-         WHERE st.school_id = $2
-           AND st.admission_number = $3
-           AND LOWER(COALESCE(st.parent_email, '')) = $4
-         ON CONFLICT (parent_user_id, student_id) DO NOTHING`,
-        [
-          parentUserId,
-          b.schoolId,
-          b.studentAdmissionNumber.trim(),
-          email
-        ]
+        `INSERT INTO parent_student_links (
+           parent_user_id,
+           student_id,
+           school_id,
+           verified_at
+         )
+         VALUES ($1, $2, $3, NULL)`,
+        [parentUserId, studentId, body.schoolId]
       );
 
       await client.query('COMMIT');
 
       res.status(201).json({
         message:
-          'Registration received. Your school must verify your account and child link before access is granted.'
+          'Registration received. Your school must verify your account and child relationship before access is granted.'
       });
-    } catch (err) {
+    } catch (error) {
       if (client) {
         await client.query('ROLLBACK').catch(() => {});
       }
 
-      if (err.code === '23505') {
+      if (error.code === '23505') {
         return res.status(409).json({
-          error: 'An account with that email already exists at this school.'
+          error:
+            'An account with that email already exists at this school.'
         });
       }
 
-      next(err);
+      next(error);
     } finally {
       if (client) client.release();
     }
@@ -229,14 +279,14 @@ router.post(
     try {
       client = await pool.connect();
 
-      const b = req.validatedBody;
-      const email = b.email.trim().toLowerCase();
+      const body = req.validatedBody;
+      const email = body.email.trim().toLowerCase();
 
       await client.query('BEGIN');
 
       const school = await client.query(
         'SELECT id FROM schools WHERE id = $1',
-        [b.schoolId]
+        [body.schoolId]
       );
 
       if (!school.rowCount) {
@@ -247,54 +297,86 @@ router.post(
         });
       }
 
-      const hash = await bcrypt.hash(b.password, 12);
+      // Verify the student's school record before creating an account.
+      const matchingStudent = await client.query(
+        `SELECT id
+         FROM students
+         WHERE school_id = $1
+           AND admission_number = $2
+           AND date_of_birth = $3::date
+           AND active = TRUE
+         LIMIT 1`,
+        [
+          body.schoolId,
+          body.admissionNumber.trim(),
+          body.dateOfBirth
+        ]
+      );
+
+      if (!matchingStudent.rowCount) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          error:
+            'The details could not be matched to an active student record. Please contact your school to check its records.'
+        });
+      }
+
+      const passwordHash = await bcrypt.hash(body.password, 12);
 
       const created = await client.query(
-        `INSERT INTO users
-           (school_id, full_name, email, password_hash, role, active)
+        `INSERT INTO users (
+           school_id,
+           full_name,
+           email,
+           password_hash,
+           role,
+           active
+         )
          VALUES ($1, $2, $3, $4, 'student', FALSE)
          RETURNING id`,
-        [b.schoolId, b.fullName.trim(), email, hash]
+        [
+          body.schoolId,
+          body.fullName.trim(),
+          email,
+          passwordHash
+        ]
       );
 
       const studentUserId = created.rows[0].id;
+      const studentId = matchingStudent.rows[0].id;
 
-      // Match the student's admission number and date of birth.
-      // The account remains inactive until the school approves it.
+      // The link is created while the account is inactive.
+      // It cannot be used to sign in until an admin approves it.
       await client.query(
-        `INSERT INTO student_accounts (user_id, student_id, school_id)
-         SELECT $1, st.id, st.school_id
-         FROM students st
-         WHERE st.school_id = $2
-           AND st.admission_number = $3
-           AND st.date_of_birth = $4::date
-         ON CONFLICT DO NOTHING`,
-        [
-          studentUserId,
-          b.schoolId,
-          b.admissionNumber.trim(),
-          b.dateOfBirth
-        ]
+        `INSERT INTO student_accounts (
+           user_id,
+           student_id,
+           school_id
+         )
+         VALUES ($1, $2, $3)`,
+        [studentUserId, studentId, body.schoolId]
       );
 
       await client.query('COMMIT');
 
       res.status(201).json({
         message:
-          'Registration received. Your school must verify your student account before access is granted.'
+          'Registration received. Your school must approve your student account before access is granted.'
       });
-    } catch (err) {
+    } catch (error) {
       if (client) {
         await client.query('ROLLBACK').catch(() => {});
       }
 
-      if (err.code === '23505') {
+      if (error.code === '23505') {
         return res.status(409).json({
-          error: 'An account with that email already exists at this school.'
+          error:
+            'An account with that email already exists, or this student record is already linked to an account.'
         });
       }
 
-      next(err);
+      next(error);
     } finally {
       if (client) client.release();
     }
@@ -346,32 +428,39 @@ router.post(
         });
       }
 
-      const student = await client.query(
-        `SELECT id
-         FROM students
-         WHERE id = $1
-           AND school_id = $2
-           AND active = TRUE`,
-        [studentId, schoolId]
+      // Only approve the exact relationship created as pending
+      // during registration. Do not create arbitrary parent links.
+      const pendingLink = await client.query(
+        `SELECT psl.student_id
+         FROM parent_student_links psl
+         JOIN students s
+           ON s.id = psl.student_id
+          AND s.school_id = psl.school_id
+         WHERE psl.parent_user_id = $1
+           AND psl.student_id = $2
+           AND psl.school_id = $3
+           AND psl.verified_at IS NULL
+           AND s.active = TRUE
+         FOR UPDATE OF psl`,
+        [parentUserId, studentId, schoolId]
       );
 
-      if (!student.rowCount) {
+      if (!pendingLink.rowCount) {
         await client.query('ROLLBACK');
 
-        return res.status(404).json({
-          error: 'Active student record not found in your school.'
+        return res.status(409).json({
+          error:
+            'No matching pending parent-child link was found. Verify the school records before approving.'
         });
       }
 
-      // IMPORTANT:
-      // The administrator must independently verify the parent-child
-      // relationship before calling this approval endpoint.
       await client.query(
-        `INSERT INTO parent_student_links
-           (parent_user_id, student_id, school_id, verified_at)
-         VALUES ($1, $2, $3, NOW())
-         ON CONFLICT (parent_user_id, student_id)
-         DO UPDATE SET verified_at = NOW()`,
+        `UPDATE parent_student_links
+         SET verified_at = NOW()
+         WHERE parent_user_id = $1
+           AND student_id = $2
+           AND school_id = $3
+           AND verified_at IS NULL`,
         [parentUserId, studentId, schoolId]
       );
 
@@ -386,15 +475,22 @@ router.post(
 
       await client.query('COMMIT');
 
+      await audit(
+        req,
+        'parent.approve',
+        'user',
+        parentUserId
+      );
+
       res.json({
-        message: 'Parent account approved and student link verified.'
+        message: 'Parent account approved and child link verified.'
       });
-    } catch (err) {
+    } catch (error) {
       if (client) {
         await client.query('ROLLBACK').catch(() => {});
       }
 
-      next(err);
+      next(error);
     } finally {
       if (client) client.release();
     }
@@ -429,7 +525,7 @@ router.post(
       await client.query('BEGIN');
 
       const account = await client.query(
-        `SELECT id
+        `SELECT id, active
          FROM users
          WHERE id = $1
            AND school_id = $2
@@ -446,37 +542,27 @@ router.post(
         });
       }
 
-      const student = await client.query(
-        `SELECT id
-         FROM students
-         WHERE id = $1
-           AND school_id = $2
-           AND active = TRUE`,
-        [studentId, schoolId]
-      );
-
-      if (!student.rowCount) {
+      if (account.rows[0].active) {
         await client.query('ROLLBACK');
 
-        return res.status(404).json({
-          error: 'Active student record not found in your school.'
+        return res.status(409).json({
+          error: 'This student account is already active.'
         });
       }
 
-      // Never overwrite a student-record association silently.
-      await client.query(
-        `INSERT INTO student_accounts (user_id, student_id, school_id)
-         VALUES ($1, $2, $3)
-         ON CONFLICT DO NOTHING`,
-        [studentUserId, studentId, schoolId]
-      );
-
+      // Verify the exact link made during registration.
+      // Never attach an account to an arbitrary student record here.
       const verifiedLink = await client.query(
-        `SELECT user_id
-         FROM student_accounts
-         WHERE user_id = $1
-           AND student_id = $2
-           AND school_id = $3`,
+        `SELECT sa.user_id
+         FROM student_accounts sa
+         JOIN students s
+           ON s.id = sa.student_id
+          AND s.school_id = sa.school_id
+         WHERE sa.user_id = $1
+           AND sa.student_id = $2
+           AND sa.school_id = $3
+           AND s.active = TRUE
+         FOR UPDATE OF sa`,
         [studentUserId, studentId, schoolId]
       );
 
@@ -485,7 +571,7 @@ router.post(
 
         return res.status(409).json({
           error:
-            'This student record is already linked to another account, or this account is linked to a different record. Review the records before approving.'
+            'No matching student registration link was found. Verify the student record before approving.'
         });
       }
 
@@ -500,15 +586,22 @@ router.post(
 
       await client.query('COMMIT');
 
+      await audit(
+        req,
+        'student.approve',
+        'user',
+        studentUserId
+      );
+
       res.json({
-        message: 'Student account approved and student record linked.'
+        message: 'Student account approved and record verified.'
       });
-    } catch (err) {
+    } catch (error) {
       if (client) {
         await client.query('ROLLBACK').catch(() => {});
       }
 
-      next(err);
+      next(error);
     } finally {
       if (client) client.release();
     }
@@ -518,8 +611,8 @@ router.post(
 /* -------------------- LOGOUT -------------------- */
 
 router.post('/logout', requireAuth, (req, res, next) => {
-  req.session.destroy((err) => {
-    if (err) return next(err);
+  req.session.destroy((error) => {
+    if (error) return next(error);
 
     res.clearCookie('educore.sid', {
       httpOnly: true,
