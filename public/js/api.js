@@ -30,9 +30,7 @@
         : JSON.stringify(options.body)
     });
 
-    if (response.status === 204) {
-      return null;
-    }
+    if (response.status === 204) return null;
 
     const data = await response.json().catch(() => ({}));
 
@@ -53,30 +51,26 @@
 
     // Authentication
     me: () => request('/auth/me'),
-
     login: (email, password) =>
       request('/auth/login', {
         method: 'POST',
         body: { email, password }
       }),
-
     logout: () =>
       request('/auth/logout', {
         method: 'POST',
         body: {}
       }),
 
-    // School list for registration forms
+    // School list and account registration
     schools: () => request('/auth/schools'),
 
-    // Parent registration
     registerParent: (details) =>
       request('/auth/signup/parent', {
         method: 'POST',
         body: details
       }),
 
-    // Student registration
     registerStudent: (details) =>
       request('/auth/signup/student', {
         method: 'POST',
@@ -86,15 +80,13 @@
     // Dashboard
     dashboard: () => request('/dashboard/summary'),
 
-    // Student records
-    students: (params = {}) =>
-      request(
-        `/students${
-          new URLSearchParams(params).size
-            ? `?${new URLSearchParams(params)}`
-            : ''
-        }`
-      ),
+    // Students
+    students: (params = {}) => {
+      const query = new URLSearchParams(params);
+      return request(
+        `/students${query.size ? `?${query}` : ''}`
+      );
+    },
 
     createStudent: (student) =>
       request('/students', {
@@ -113,7 +105,7 @@
         method: 'DELETE'
       }),
 
-    // Teacher records and teacher account creation
+    // Teachers
     teachers: () => request('/teachers'),
 
     createTeacher: (teacher) =>
@@ -143,7 +135,7 @@
         body: { date, records }
       }),
 
-    // Exam results
+    // Results
     results: () => request('/results'),
 
     createResult: (result) =>
